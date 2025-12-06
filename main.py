@@ -8,6 +8,7 @@ import random
 from typing import Optional, List, Tuple, Dict
 from datetime import datetime
 import os
+from aiohttp import web
 
 # Конфигурация уровней сложности
 DIFFICULTIES = {
@@ -634,26 +635,60 @@ class MinesweeperBot(commands.Bot):
         self.active_games: Dict[int, MinesweeperGame] = {}
         self.game_messages: Dict[int, Dict[str, int]] = {}  # player_id -> {"info": msg_id, "blocks": {...}}
         self.db = None
+        self.http_server = None
     
     async def setup_hook(self):
         db_url = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/minesweeper")
         self.db = Database(db_url)
         await self.db.connect()
         await self.tree.sync()
+        
+        # Запускаем HTTP сервер для Render health checks
+        await self.start_http_server()
+        
         print(f"Бот {self.user} готов!")
     
+    async def start_http_server(self):
+        """Запускает простой HTTP сервер для health checks"""
+        app = web.Application()
+        app.router.add_get('/', self.health_check)
+        app.router.add_get('/health', self.health_check)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        port = int(os.getenv("PORT", 10000))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        print(f"HTTP сервер запущен на порту {port}")
+    
+    async def health_check(self, request):
+        """Эндпоинт для проверки здоровья"""
+        return web.Response(text="OK", status=200)
+    
     async def update_game_blocks(self, game: MinesweeperGame, affected_blocks: List[Tuple[int, int]]):
-        """Обновляет только затронутые блоки игры"""
-        update_tasks = []
+        """Обновляет только затронутые блоки игры с задержками для избежания rate limit"""
+        # Ограничиваем количество одновременных обновлений
+        MAX_CONCURRENT_UPDATES = 3
+        DELAY_BETWEEN_BATCHES = 1.0  # секунды
         
-        for block_x, block_y in affected_blocks:
-            if (block_x, block_y) in game.block_messages:
-                msg_id = game.block_messages[(block_x, block_y)]
-                update_tasks.append(self._update_single_block(game, block_x, block_y, msg_id))
-        
-        # Параллельное обновление для скорости
-        if update_tasks:
-            await asyncio.gather(*update_tasks, return_exceptions=True)
+        # Разбиваем на батчи
+        for i in range(0, len(affected_blocks), MAX_CONCURRENT_UPDATES):
+            batch = affected_blocks[i:i + MAX_CONCURRENT_UPDATES]
+            tasks = []
+            
+            for block_x, block_y in batch:
+                if (block_x, block_y) in game.block_messages:
+                    msg_id = game.block_messages[(block_x, block_y)]
+                    tasks.append(self._update_single_block(game, block_x, block_y, msg_id))
+            
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Задержка между батчами
+                if i + MAX_CONCURRENT_UPDATES < len(affected_blocks):
+                    await asyncio.sleep(DELAY_BETWEEN_BATCHES)
     
     async def _update_single_block(self, game: MinesweeperGame, block_x: int, block_y: int, msg_id: int):
         """Обновляет один блок"""
@@ -670,7 +705,10 @@ class MinesweeperBot(commands.Bot):
                                 view = BlockView(game, block_x, block_y, self)
                                 await message.edit(view=view)
                                 return
-                            except:
+                            except discord.errors.HTTPException as e:
+                                if e.status == 429:  # Rate limit
+                                    print(f"Rate limit при обновлении блока ({block_x}, {block_y}), пропускаем")
+                                    return
                                 pass
         except Exception as e:
             print(f"Ошибка обновления блока ({block_x}, {block_y}): {e}")
@@ -691,7 +729,10 @@ class MinesweeperBot(commands.Bot):
                                 embed = self.create_info_embed(game)
                                 view = ControlView(game, self)
                                 await message.edit(embed=embed, view=view)
-                            except:
+                            except discord.errors.HTTPException as e:
+                                if e.status == 429:
+                                    print("Rate limit при обновлении инфо, пропускаем")
+                                    return
                                 pass
         except Exception as e:
             print(f"Ошибка обновления информации: {e}")
@@ -725,7 +766,7 @@ class MinesweeperBot(commands.Bot):
         
         # Статистика
         embed.add_field(name="⏱️ Время", value=f"{game.get_time():.2f} сек", inline=True)
-        embed.add_field(name="📐 Поле", value=f"{game.width}×{game.height}", inline=True)
+        embed.add_field(name="📏 Поле", value=f"{game.width}×{game.height}", inline=True)
         embed.add_field(name="💣 Мины", value=f"{game.mines_count}", inline=True)
         
         # Инструкция
@@ -805,10 +846,11 @@ async def minesweeper(interaction: discord.Interaction, сложность: str)
     info_msg = await interaction.followup.send(embed=embed, view=view)
     bot.game_messages[interaction.user.id]["info"] = info_msg.id
     
-    # Создаем блоки игрового поля
+    # Создаем блоки игрового поля (ИСПРАВЛЕНО: правильный порядок)
     blocks_x = (game.width + BLOCK_SIZE - 1) // BLOCK_SIZE
     blocks_y = (game.height + BLOCK_SIZE - 1) // BLOCK_SIZE
     
+    # ВАЖНО: сначала по Y (строки), потом по X (столбцы) для правильного отображения
     for by in range(blocks_y):
         for bx in range(blocks_x):
             view = BlockView(game, bx, by, bot)
@@ -825,6 +867,9 @@ async def minesweeper(interaction: discord.Interaction, сложность: str)
             )
             
             game.block_messages[(bx, by)] = block_msg.id
+            
+            # Задержка для избежания rate limit
+            await asyncio.sleep(0.5)
     
     await interaction.channel.send("✅ Игра создана! Кликайте по клеткам выше для игры.")
 
@@ -884,7 +929,7 @@ async def coop(interaction: discord.Interaction, партнёр: discord.User, �
     bot.game_messages[interaction.user.id]["info"] = info_msg.id
     bot.game_messages[партнёр.id]["info"] = info_msg.id
     
-    # Создаем блоки
+    # Создаем блоки (с правильным порядком)
     blocks_x = (game.width + BLOCK_SIZE - 1) // BLOCK_SIZE
     blocks_y = (game.height + BLOCK_SIZE - 1) // BLOCK_SIZE
     
@@ -903,6 +948,7 @@ async def coop(interaction: discord.Interaction, партнёр: discord.User, �
             )
             
             game.block_messages[(bx, by)] = block_msg.id
+            await asyncio.sleep(0.5)
     
     await interaction.channel.send("✅ Кооперативная игра создана!")
 
