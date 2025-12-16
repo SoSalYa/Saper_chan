@@ -9,11 +9,11 @@ from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 import asyncio
 from aiohttp import web
-import threading
 
 # Конфигурация
 DATABASE_URL = os.getenv('DATABASE_URL')  # Session pooler connection string
 TOKEN = os.getenv('DISCORD_TOKEN')
+PORT = int(os.getenv('PORT', 10000))  # Render использует переменную PORT
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -808,7 +808,37 @@ async def profile(interaction: discord.Interaction, user: discord.User = None):
     
     await interaction.followup.send(embed=embed)
 
+# HTTP server для Render health check
+async def health_check(request):
+    """Health check endpoint для Render"""
+    return web.Response(text='OK', status=200)
 
+async def start_http_server():
+    """Запускает HTTP сервер для health check"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f'🌐 HTTP server запущен на порту {PORT}')
+
+@bot.event
+async def on_ready():
+    print(f'✅ Бот запущен как {bot.user}')
+    print(f'📊 Серверов: {len(bot.guilds)}')
+    print(f'⚡ База данных подключена')
+    
+    # Запускаем HTTP сервер для Render
+    bot.loop.create_task(start_http_server())
+
+@bot.event
+async def on_thread_delete(thread):
+    """Очистка при удалении треда"""
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute('DELETE FROM active_games WHERE thread_id = $1', thread.id)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
