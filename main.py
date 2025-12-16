@@ -242,7 +242,7 @@ class MinesweeperView(discord.ui.View):
 
 class MinesweeperButton(discord.ui.Button):
     def __init__(self, x: int, y: int, block_idx: int, value: int):
-        super().__init__(style=discord.ButtonStyle.success, label='❔', row=y)
+        super().__init__(style=discord.ButtonStyle.secondary, label='⬜', row=y)
         self.x = x
         self.y = y
         self.block_idx = block_idx
