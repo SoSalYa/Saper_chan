@@ -830,9 +830,6 @@ async def on_ready():
     print(f'✅ Бот запущен как {bot.user}')
     print(f'📊 Серверов: {len(bot.guilds)}')
     print(f'⚡ База данных подключена')
-    
-    # Запускаем HTTP сервер для Render
-    bot.loop.create_task(start_http_server())
 
 @bot.event
 async def on_thread_delete(thread):
@@ -840,5 +837,14 @@ async def on_thread_delete(thread):
     async with bot.db_pool.acquire() as conn:
         await conn.execute('DELETE FROM active_games WHERE thread_id = $1', thread.id)
 
+async def main():
+    """Главная функция для запуска бота и HTTP сервера"""
+    # Сначала запускаем HTTP сервер
+    await start_http_server()
+    
+    # Затем запускаем бота
+    async with bot:
+        await bot.start(TOKEN)
+
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    asyncio.run(main())
