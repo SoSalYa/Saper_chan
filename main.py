@@ -8,6 +8,8 @@ import time
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 import asyncio
+from aiohttp import web
+import threading
 
 # Конфигурация
 DATABASE_URL = os.getenv('DATABASE_URL')  # Session pooler connection string
@@ -806,17 +808,7 @@ async def profile(interaction: discord.Interaction, user: discord.User = None):
     
     await interaction.followup.send(embed=embed)
 
-@bot.event
-async def on_ready():
-    print(f'✅ Бот запущен как {bot.user}')
-    print(f'📊 Серверов: {len(bot.guilds)}')
-    print(f'⚡ База данных подключена')
 
-@bot.event
-async def on_thread_delete(thread):
-    """Очистка при удалении треда"""
-    async with bot.db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM active_games WHERE thread_id = $1', thread.id)
 
 if __name__ == "__main__":
     bot.run(TOKEN)
