@@ -5,15 +5,13 @@ import asyncpg
 import os
 import random
 import time
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from datetime import datetime, timedelta
 import asyncio
-from aiohttp import web
 
 # Конфигурация
-DATABASE_URL = os.getenv('DATABASE_URL')
+DATABASE_URL = os.getenv('DATABASE_URL')  # Session pooler connection string
 TOKEN = os.getenv('DISCORD_TOKEN')
-PORT = int(os.getenv('PORT', 10000))
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -22,6 +20,7 @@ class MinesweeperBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix='!', intents=intents)
         self.db_pool = None
+        self.active_games = {}  # Хранение игр в памяти для скорости
     
     async def setup_hook(self):
         await self.tree.sync()
@@ -41,22 +40,6 @@ class MinesweeperBot(commands.Bot):
                     best_blocks_normal INTEGER DEFAULT 0,
                     best_blocks_hardcore INTEGER DEFAULT 0,
                     created_at TIMESTAMP DEFAULT NOW()
-                )
-            ''')
-            
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS active_games (
-                    thread_id BIGINT PRIMARY KEY,
-                    user_id BIGINT,
-                    mode TEXT,
-                    current_block INTEGER DEFAULT 0,
-                    blocks_cleared INTEGER DEFAULT 0,
-                    start_time TIMESTAMP,
-                    last_action_time TIMESTAMP,
-                    is_multiplayer BOOLEAN DEFAULT FALSE,
-                    hardcore_timer FLOAT DEFAULT 0,
-                    game_data JSONB,
-                    FOREIGN KEY (user_id) REFERENCES players(user_id)
                 )
             ''')
             
@@ -85,88 +68,72 @@ class MinesweeperGame:
         self.start_time = time.time()
         self.last_action_time = time.time()
         self.hardcore_timer = 30.0 if mode == 'hardcore' else 0
-        self.grid = []  # Единая сетка 10x5 (два блока по вертикали)
-        self.mines = set()
-        self.cells_revealed = set()
-        self.message_ids = []
-        self.first_click = True
         
-    def generate_field(self, difficulty_level=0):
-        """Генерирует поле 10x5 (два блока 5x5 по вертикали)"""
+        # Вертикальная цепочка блоков: {block_index: {grid, mines, cells_revealed, message_id, completed}}
+        self.blocks: Dict[int, dict] = {}
+        self.current_max_block = 1  # Максимальный отправленный блок
+        
+        # Генерируем первые 2 блока
+        self.generate_block(0)
+        self.generate_block(1)
+    
+    def generate_block(self, block_index: int):
+        """Генерирует один блок 5x5"""
         if self.mode == 'hardcore':
             base_mines = 5
-            mines_count = min(base_mines + (difficulty_level // 3), 12)
+            mines_count = min(base_mines + (self.blocks_cleared // 3), 12)
         else:
             mines_count = 5
         
-        # Создаем пустую сетку 10x5
-        self.grid = [[0 for _ in range(5)] for _ in range(10)]
-        self.mines = set()
+        grid = [[0 for _ in range(5)] for _ in range(5)]
+        mines = set()
         
-        # Размещаем бомбы
-        while len(self.mines) < mines_count:
-            x, y = random.randint(0, 4), random.randint(0, 9)
-            if (x, y) not in self.mines:
-                self.mines.add((x, y))
-                self.grid[y][x] = -1
+        while len(mines) < mines_count:
+            x, y = random.randint(0, 4), random.randint(0, 4)
+            if (x, y) not in mines:
+                mines.add((x, y))
+                grid[y][x] = -1
         
-        # Вычисляем числа для всей сетки
-        for y in range(10):
+        # Вычисляем числа
+        for y in range(5):
             for x in range(5):
-                if self.grid[y][x] != -1:
+                if grid[y][x] != -1:
                     count = 0
                     for dy in [-1, 0, 1]:
                         for dx in [-1, 0, 1]:
                             ny, nx = y + dy, x + dx
-                            if 0 <= ny < 10 and 0 <= nx < 5 and self.grid[ny][nx] == -1:
+                            if 0 <= ny < 5 and 0 <= nx < 5 and grid[ny][nx] == -1:
                                 count += 1
-                    self.grid[y][x] = count
-    
-    def ensure_safe_first_click(self, x, y):
-        """Гарантирует, что первый клик безопасный"""
-        if (x, y) in self.mines:
-            # Перемещаем бомбу в другое место
-            self.mines.remove((x, y))
-            self.grid[y][x] = 0
-            
-            # Находим новое место для бомбы
-            while True:
-                new_x, new_y = random.randint(0, 4), random.randint(0, 9)
-                if (new_x, new_y) not in self.mines and (new_x, new_y) != (x, y):
-                    self.mines.add((new_x, new_y))
-                    self.grid[new_y][new_x] = -1
-                    break
-            
-            # Пересчитываем числа вокруг обеих клеток
-            for cy, cx in [(y, x), (new_y, new_x)]:
-                for dy in range(-1, 2):
-                    for dx in range(-1, 2):
-                        ny, nx = cy + dy, cx + dx
-                        if 0 <= ny < 10 and 0 <= nx < 5 and self.grid[ny][nx] != -1:
-                            count = 0
-                            for ddy in [-1, 0, 1]:
-                                for ddx in [-1, 0, 1]:
-                                    nny, nnx = ny + ddy, nx + ddx
-                                    if 0 <= nny < 10 and 0 <= nnx < 5 and self.grid[nny][nnx] == -1:
-                                        count += 1
-                            self.grid[ny][nx] = count
+                    grid[y][x] = count
+        
+        self.blocks[block_index] = {
+            'grid': grid,
+            'mines': mines,
+            'cells_revealed': set(),
+            'message_id': None,
+            'completed': False
+        }
     
     def get_time_bonus_hardcore(self):
         base_bonus = 18
         reduction = (self.blocks_cleared // 5) * 1
         return max(5, base_bonus - reduction)
     
-    def reveal_cell(self, x, y):
+    def reveal_cell(self, block_idx: int, x: int, y: int):
         """Открывает клетку"""
-        if (x, y) in self.cells_revealed:
+        if block_idx not in self.blocks:
+            return 'invalid', set()
+        
+        block = self.blocks[block_idx]
+        if block['completed']:
+            return 'invalid', set()
+        
+        grid = block['grid']
+        
+        if (x, y) in block['cells_revealed']:
             return 'already_revealed', set()
         
-        # Первый клик всегда безопасный
-        if self.first_click:
-            self.ensure_safe_first_click(x, y)
-            self.first_click = False
-        
-        if self.grid[y][x] == -1:
+        if grid[y][x] == -1:
             return 'mine', {(x, y)}
         
         # Flood fill
@@ -175,74 +142,63 @@ class MinesweeperGame:
         
         while stack:
             cx, cy = stack.pop()
-            if (cx, cy) in self.cells_revealed or (cx, cy) in revealed:
+            if (cx, cy) in block['cells_revealed'] or (cx, cy) in revealed:
                 continue
             
             revealed.add((cx, cy))
             
-            if self.grid[cy][cx] == 0:
+            if grid[cy][cx] == 0:
                 for dy in [-1, 0, 1]:
                     for dx in [-1, 0, 1]:
                         nx, ny = cx + dx, cy + dy
-                        if 0 <= ny < 10 and 0 <= nx < 5:
-                            if (nx, ny) not in self.cells_revealed:
+                        if 0 <= nx < 5 and 0 <= ny < 5:
+                            if (nx, ny) not in block['cells_revealed']:
                                 stack.append((nx, ny))
         
         return 'safe', revealed
     
-    def is_field_complete(self):
-        """Проверяет, пройдено ли всё поле"""
-        total_safe_cells = 0
-        revealed_safe_cells = 0
+    def is_block_complete(self, block_idx: int) -> bool:
+        """Проверяет, пройден ли блок"""
+        if block_idx not in self.blocks:
+            return False
         
-        for y in range(10):
-            for x in range(5):
-                if self.grid[y][x] != -1:
-                    total_safe_cells += 1
-                    if (x, y) in self.cells_revealed:
-                        revealed_safe_cells += 1
+        block = self.blocks[block_idx]
+        total_safe = 25 - len(block['mines'])
+        revealed_safe = len(block['cells_revealed'])
         
-        return revealed_safe_cells == total_safe_cells
+        return revealed_safe == total_safe
 
 class MinesweeperView(discord.ui.View):
-    def __init__(self, game: MinesweeperGame, user_id: int, thread_id: int, block_idx: int):
+    def __init__(self, game: MinesweeperGame, block_idx: int, user_id: int, thread_id: int):
         super().__init__(timeout=None)
         self.game = game
+        self.block_idx = block_idx
         self.user_id = user_id
         self.thread_id = thread_id
-        self.block_idx = block_idx  # 0 или 1 (верхний или нижний блок)
         self.update_buttons()
     
     def update_buttons(self):
         self.clear_items()
         
-        # Определяем диапазон Y для этого блока
-        y_start = self.block_idx * 5
-        y_end = y_start + 5
+        if self.block_idx not in self.game.blocks:
+            return
         
-        for local_y in range(5):
+        block = self.game.blocks[self.block_idx]
+        grid = block['grid']
+        
+        for y in range(5):
             for x in range(5):
-                global_y = y_start + local_y
-                button = MinesweeperButton(x, global_y, self.game.grid[global_y][x], local_y)
+                button = MinesweeperButton(x, y, self.block_idx)
                 
-                if (x, global_y) in self.game.cells_revealed:
+                if (x, y) in block['cells_revealed']:
                     button.disabled = True
-                    value = self.game.grid[global_y][x]
+                    value = grid[y][x]
                     if value == 0:
-                        button.label = '◽'
+                        button.label = '·'
                         button.style = discord.ButtonStyle.secondary
-                    elif value == -1:
-                        button.label = '💣'
-                        button.style = discord.ButtonStyle.danger
                     else:
-                        # Цветные числа как в настоящем сапёре
                         button.label = str(value)
-                        if value == 1:
-                            button.style = discord.ButtonStyle.primary
-                        elif value == 2:
-                            button.style = discord.ButtonStyle.success
-                        else:
-                            button.style = discord.ButtonStyle.danger
+                        button.style = discord.ButtonStyle.primary
                 
                 self.add_item(button)
     
@@ -253,103 +209,69 @@ class MinesweeperView(discord.ui.View):
         return True
 
 class MinesweeperButton(discord.ui.Button):
-    def __init__(self, x: int, y: int, value: int, row: int):
-        super().__init__(style=discord.ButtonStyle.secondary, label='⬜', row=row)
+    def __init__(self, x: int, y: int, block_idx: int):
+        super().__init__(style=discord.ButtonStyle.success, label='❔', row=y)
         self.x = x
         self.y = y
-        self.cell_value = value
+        self.block_idx = block_idx
     
     async def callback(self, interaction: discord.Interaction):
         view: MinesweeperView = self.view
         game = view.game
         
-        # Таймаут Discord - отвечаем быстро
-        try:
-            await interaction.response.defer()
-        except:
-            return
+        # ОПТИМИЗАЦИЯ: Немедленный defer для скорости
+        await interaction.response.defer()
         
         game.last_action_time = time.time()
         
-        result, revealed = game.reveal_cell(self.x, self.y)
+        result, revealed = game.reveal_cell(self.block_idx, self.x, self.y)
         
-        if result == 'already_revealed':
+        if result == 'invalid' or result == 'already_revealed':
             return
         
         if result == 'mine':
             await self.handle_game_over(interaction, view)
             return
         
-        game.cells_revealed.update(revealed)
+        # Добавляем открытые клетки
+        block = game.blocks[self.block_idx]
+        block['cells_revealed'].update(revealed)
         
-        if game.is_field_complete():
-            await self.handle_field_complete(interaction, view)
+        # Проверяем, завершён ли блок
+        if game.is_block_complete(self.block_idx):
+            await self.handle_block_complete(interaction, view)
         else:
-            # Обновляем оба блока
-            await self.update_both_views(interaction, view)
-    
-    async def update_both_views(self, interaction: discord.Interaction, view: MinesweeperView):
-        """Обновляет оба блока на экране"""
-        thread = interaction.channel
-        game = view.game
-        
-        try:
-            # Обновляем оба сообщения
-            for i, msg_id in enumerate(game.message_ids):
-                try:
-                    msg = await thread.fetch_message(msg_id)
-                    new_view = MinesweeperView(game, view.user_id, view.thread_id, i)
-                    
-                    timer_text = ""
-                    if game.mode == 'hardcore':
-                        timer_text = f" | ⏱️ **{game.hardcore_timer:.1f}с**"
-                    
-                    safe_cells = len([1 for y in range(10) for x in range(5) if game.grid[y][x] != -1])
-                    revealed = len(game.cells_revealed)
-                    
-                    await msg.edit(
-                        content=f"🎮 **Блок {game.blocks_cleared + 1} - {'Верх' if i == 0 else 'Низ'}** | Открыто: **{revealed}/{safe_cells}**{timer_text}",
-                        view=new_view
-                    )
-                except:
-                    pass
-        except:
-            pass
+            # ОПТИМИЗАЦИЯ: Обновляем только кнопки, без пересоздания view
+            view.update_buttons()
+            
+            timer_text = ""
+            if game.mode == 'hardcore':
+                timer_text = f" | ⏱️ {game.hardcore_timer:.1f}с"
+            
+            try:
+                await interaction.edit_original_response(
+                    content=f"🎮 Блок #{self.block_idx + 1}{timer_text}",
+                    view=view
+                )
+            except:
+                pass
     
     async def handle_game_over(self, interaction: discord.Interaction, view: MinesweeperView):
         game = view.game
-        thread = interaction.channel
         
-        # Показываем все бомбы
-        for x, y in game.mines:
-            game.cells_revealed.add((x, y))
+        # Показываем все бомбы в текущем блоке
+        block = game.blocks[self.block_idx]
+        for x, y in block['mines']:
+            block['cells_revealed'].add((x, y))
         
-        # Определяем в каком блоке проиграли
-        failed_block_idx = 0 if self.y < 5 else 1
+        view.update_buttons()
+        for item in view.children:
+            item.disabled = True
         
-        # Удаляем ВСЕ сообщения кроме того где проиграли
-        for i, msg_id in enumerate(game.message_ids):
-            try:
-                msg = await thread.fetch_message(msg_id)
-                if i == failed_block_idx:
-                    # Обновляем блок где проиграли
-                    failed_view = MinesweeperView(game, view.user_id, view.thread_id, i)
-                    for item in failed_view.children:
-                        item.disabled = True
-                    await msg.edit(
-                        content=f"💀 **ВЫ ПРОИГРАЛИ НА БЛОКЕ {game.blocks_cleared + 1}**",
-                        view=failed_view
-                    )
-                else:
-                    # Удаляем другой блок
-                    await msg.delete()
-            except:
-                pass
-        
-        # Сохраняем статистику
         total_time = time.time() - game.start_time
         avg_speed = game.blocks_cleared / total_time if total_time > 0 and game.blocks_cleared > 0 else 0
         
+        # Сохраняем статистику
         async with bot.db_pool.acquire() as conn:
             if game.mode == 'hardcore':
                 await conn.execute('''
@@ -374,6 +296,7 @@ class MinesweeperButton(discord.ui.Button):
                         best_blocks_normal = CASE WHEN $6 > players.best_blocks_normal THEN $6 ELSE players.best_blocks_normal END
                 ''', interaction.user.id, str(interaction.user), game.blocks_cleared, total_time, avg_speed, game.blocks_cleared)
             
+            # Обновляем speed leaderboard
             total_blocks = await conn.fetchval('SELECT total_blocks_cleared FROM players WHERE user_id = $1', interaction.user.id)
             total_time_all = await conn.fetchval('SELECT total_time_spent FROM players WHERE user_id = $1', interaction.user.id)
             new_avg_speed = total_blocks / total_time_all if total_time_all > 0 else 0
@@ -384,77 +307,93 @@ class MinesweeperButton(discord.ui.Button):
                 ON CONFLICT (user_id) DO UPDATE SET
                     avg_speed = $3, total_blocks = $4, total_time = $5, last_updated = NOW()
             ''', interaction.user.id, str(interaction.user), new_avg_speed, total_blocks, total_time_all)
-            
-            await conn.execute('DELETE FROM active_games WHERE thread_id = $1', view.thread_id)
         
-        # Отправляем статистику
+        # Удаляем игру из памяти
+        if view.thread_id in bot.active_games:
+            del bot.active_games[view.thread_id]
+        
         mode_emoji = "💀" if game.mode == "hardcore" else "💣"
-        stats_msg = (
-            f"{mode_emoji} **ИГРА ОКОНЧЕНА!**\n\n"
-            f"📊 **Статистика:**\n"
-            f"├ Блоков пройдено: **{game.blocks_cleared}**\n"
-            f"├ Время игры: **{total_time:.1f}с**\n"
-            f"├ Лучшая скорость: **{avg_speed:.3f}** блоков/сек\n"
-            f"└ Средняя скорость: **{new_avg_speed:.3f}** блоков/сек (всего)"
-        )
-        
-        await thread.send(stats_msg)
+        try:
+            await interaction.edit_original_response(
+                content=f"{mode_emoji} **ИГРА ОКОНЧЕНА!**\n"
+                        f"Блоков пройдено: **{game.blocks_cleared}**\n"
+                        f"Время игры: **{total_time:.2f}с**\n"
+                        f"Средняя скорость: **{avg_speed:.3f} блоков/сек**",
+                view=view
+            )
+        except:
+            pass
     
-    async def handle_field_complete(self, interaction: discord.Interaction, view: MinesweeperView):
+    async def handle_block_complete(self, interaction: discord.Interaction, view: MinesweeperView):
         game = view.game
         thread = interaction.channel
+        
+        # Помечаем блок как завершённый
+        game.blocks[self.block_idx]['completed'] = True
         game.blocks_cleared += 1
         
+        # Обновляем хардкор таймер
         if game.mode == 'hardcore':
             bonus = game.get_time_bonus_hardcore()
             game.hardcore_timer += bonus
         
-        # Удаляем старые сообщения
-        for msg_id in game.message_ids:
-            try:
-                msg = await thread.fetch_message(msg_id)
-                await msg.delete()
-            except:
-                pass
-        game.message_ids.clear()
+        # Отключаем кнопки завершённого блока
+        for item in view.children:
+            item.disabled = True
         
-        # Генерируем новое поле
-        game.generate_field(game.blocks_cleared)
-        game.cells_revealed.clear()
-        game.first_click = True
+        try:
+            await interaction.edit_original_response(
+                content=f"✅ **Блок #{self.block_idx + 1} пройден!**",
+                view=view
+            )
+        except:
+            pass
         
-        async with bot.db_pool.acquire() as conn:
-            await conn.execute('''
-                UPDATE active_games 
-                SET blocks_cleared = $1, last_action_time = NOW(), hardcore_timer = $2
-                WHERE thread_id = $3
-            ''', game.blocks_cleared, game.hardcore_timer, view.thread_id)
+        # Проверяем, все ли видимые блоки завершены
+        all_visible_complete = all(
+            game.blocks[i]['completed'] 
+            for i in range(game.current_max_block + 1) 
+            if i in game.blocks
+        )
         
-        await send_game_blocks(thread, game, view.user_id, view.thread_id)
+        if all_visible_complete:
+            # Удаляем завершённые блоки
+            completed_blocks = [i for i in game.blocks if game.blocks[i]['completed']]
+            for block_idx in completed_blocks:
+                try:
+                    msg_id = game.blocks[block_idx]['message_id']
+                    if msg_id:
+                        msg = await thread.fetch_message(msg_id)
+                        await msg.delete()
+                except:
+                    pass
+                del game.blocks[block_idx]
+            
+            # Генерируем новые блоки
+            new_block_1 = game.current_max_block + 1
+            new_block_2 = game.current_max_block + 2
+            
+            game.generate_block(new_block_1)
+            game.generate_block(new_block_2)
+            game.current_max_block = new_block_2
+            
+            # Отправляем новые блоки
+            await send_block(thread, game, new_block_1, view.user_id, view.thread_id)
+            await send_block(thread, game, new_block_2, view.user_id, view.thread_id)
 
-async def send_game_blocks(thread, game: MinesweeperGame, user_id: int, thread_id: int):
-    """Отправляет два блока 5x5"""
+async def send_block(thread, game: MinesweeperGame, block_idx: int, user_id: int, thread_id: int):
+    """Отправляет один блок 5x5"""
     timer_text = ""
     if game.mode == 'hardcore':
-        timer_text = f" | ⏱️ **{game.hardcore_timer:.1f}с**"
+        timer_text = f" | ⏱️ {game.hardcore_timer:.1f}с"
     
-    safe_cells = len([1 for y in range(10) for x in range(5) if game.grid[y][x] != -1])
-    
-    # Верхний блок
-    view1 = MinesweeperView(game, user_id, thread_id, 0)
-    msg1 = await thread.send(
-        f"🎮 **Блок {game.blocks_cleared + 1} - Верх** | Открыто: **0/{safe_cells}**{timer_text}",
-        view=view1
+    view = MinesweeperView(game, block_idx, user_id, thread_id)
+    msg = await thread.send(
+        f"🎮 **Блок #{block_idx + 1}**{timer_text}",
+        view=view
     )
-    game.message_ids.append(msg1.id)
     
-    # Нижний блок
-    view2 = MinesweeperView(game, user_id, thread_id, 1)
-    msg2 = await thread.send(
-        f"🎮 **Блок {game.blocks_cleared + 1} - Низ** | Открыто: **0/{safe_cells}**{timer_text}",
-        view=view2
-    )
-    game.message_ids.append(msg2.id)
+    game.blocks[block_idx]['message_id'] = msg.id
 
 @bot.tree.command(name="minesweeper", description="Начать игру в бесконечный сапёр")
 @app_commands.describe(
@@ -462,14 +401,11 @@ async def send_game_blocks(thread, game: MinesweeperGame, user_id: int, thread_i
     multiplayer="Игра для всех в канале"
 )
 @app_commands.choices(mode=[
-    app_commands.Choice(name="Обычный", value="normal"),
-    app_commands.Choice(name="Хардкор (с таймером)", value="hardcore")
+    app_commands.Choice(name="🎮 Обычный", value="normal"),
+    app_commands.Choice(name="💀 Хардкор", value="hardcore")
 ])
 async def minesweeper(interaction: discord.Interaction, mode: str = "normal", multiplayer: bool = False):
-    try:
-        await interaction.response.defer(ephemeral=True)
-    except:
-        return
+    await interaction.response.defer()
     
     async with bot.db_pool.acquire() as conn:
         await conn.execute('''
@@ -480,42 +416,46 @@ async def minesweeper(interaction: discord.Interaction, mode: str = "normal", mu
     
     mode_name = "💀 Хардкор" if mode == "hardcore" else "🎮 Обычный"
     mp_text = "👥 Мультиплеер" if multiplayer else f"👤 {interaction.user.display_name}"
+    
     thread = await interaction.channel.create_thread(
         name=f"Сапёр: {mode_name} | {mp_text}",
         auto_archive_duration=60
     )
     
     game = MinesweeperGame(mode=mode, is_multiplayer=multiplayer)
-    game.generate_field(0)
-    
-    async with bot.db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO active_games (thread_id, user_id, mode, start_time, last_action_time, is_multiplayer, hardcore_timer)
-            VALUES ($1, $2, $3, NOW(), NOW(), $4, $5)
-        ''', thread.id, interaction.user.id, mode, multiplayer, game.hardcore_timer)
+    bot.active_games[thread.id] = game
     
     welcome_text = f"🎮 **Бесконечный Сапёр - {mode_name}**\n\n"
     if mode == "hardcore":
-        welcome_text += "⏱️ Ограниченное время! За блоки дается бонус\n"
-        welcome_text += "⚡ Сложность растёт с каждым блоком!\n\n"
+        welcome_text += "⏱️ Ограниченное время на прохождение!\n"
+        welcome_text += "✅ Бонусное время за каждый блок\n"
+        welcome_text += "⚡ Прогрессивная сложность!\n\n"
     else:
-        welcome_text += "✨ Открывайте безопасные клетки\n"
-        welcome_text += "🎯 Первый клик всегда безопасный!\n\n"
+        welcome_text += "✨ Откройте все безопасные клетки\n"
+        welcome_text += "🎯 Фиксированная сложность\n\n"
     
     if multiplayer:
-        welcome_text += "👥 Любой может участвовать!\n"
+        welcome_text += "👥 Все могут играть!\n"
     
-    welcome_text += "Удачи! 🍀"
+    welcome_text += "\n📊 **Механика:**\n"
+    welcome_text += "• Блоки выстроены вертикально\n"
+    welcome_text += "• Пройдите блок → он исчезнет\n"
+    welcome_text += "• Новый блок появится снизу\n"
+    welcome_text += "• Бесконечное поле вниз! ⬇️\n\nУдачи! 🍀"
     
     await thread.send(welcome_text)
-    await send_game_blocks(thread, game, interaction.user.id, thread.id)
+    
+    # Отправляем первые 2 блока
+    await send_block(thread, game, 0, interaction.user.id, thread.id)
+    await send_block(thread, game, 1, interaction.user.id, thread.id)
     
     if mode == "hardcore":
-        bot.loop.create_task(hardcore_timer_loop(thread.id, game))
+        bot.loop.create_task(hardcore_timer_loop(thread.id, game, interaction.user.id))
     
-    await interaction.followup.send(f"✅ Игра создана! {thread.mention}", ephemeral=True)
+    await interaction.followup.send(f"✅ Игра создана! {thread.mention}")
 
-async def hardcore_timer_loop(thread_id: int, game: MinesweeperGame):
+async def hardcore_timer_loop(thread_id: int, game: MinesweeperGame, user_id: int):
+    """Таймер для хардкора"""
     while game.hardcore_timer > 0:
         await asyncio.sleep(0.5)
         game.hardcore_timer -= 0.5
@@ -524,42 +464,54 @@ async def hardcore_timer_loop(thread_id: int, game: MinesweeperGame):
             try:
                 thread = bot.get_channel(thread_id)
                 if thread:
-                    async with bot.db_pool.acquire() as conn:
-                        user_id = await conn.fetchval('SELECT user_id FROM active_games WHERE thread_id = $1', thread_id)
-                        
-                        total_time = time.time() - game.start_time
-                        avg_speed = game.blocks_cleared / total_time if total_time > 0 and game.blocks_cleared > 0 else 0
-                        
-                        if user_id:
-                            await conn.execute('''
-                                INSERT INTO players (user_id, username, total_blocks_cleared, total_time_spent, best_speed, games_played, best_blocks_hardcore)
-                                VALUES ($1, '', $2, $3, $4, 1, $5)
-                                ON CONFLICT (user_id) DO UPDATE SET
-                                    total_blocks_cleared = players.total_blocks_cleared + $2,
-                                    total_time_spent = players.total_time_spent + $3,
-                                    best_speed = CASE WHEN $4 > players.best_speed THEN $4 ELSE players.best_speed END,
-                                    games_played = players.games_played + 1,
-                                    best_blocks_hardcore = CASE WHEN $5 > players.best_blocks_hardcore THEN $5 ELSE players.best_blocks_hardcore END
-                            ''', user_id, game.blocks_cleared, total_time, avg_speed, game.blocks_cleared)
-                        
-                        await conn.execute('DELETE FROM active_games WHERE thread_id = $1', thread_id)
+                    total_time = time.time() - game.start_time
+                    avg_speed = game.blocks_cleared / total_time if total_time > 0 and game.blocks_cleared > 0 else 0
                     
-                    await thread.send(f"⏰ **ВРЕМЯ ВЫШЛО!** Блоков: {game.blocks_cleared} | Скорость: {avg_speed:.3f}/с")
+                    async with bot.db_pool.acquire() as conn:
+                        await conn.execute('''
+                            INSERT INTO players (user_id, username, total_blocks_cleared, total_time_spent, best_speed, games_played, best_blocks_hardcore)
+                            VALUES ($1, '', $2, $3, $4, 1, $5)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                total_blocks_cleared = players.total_blocks_cleared + $2,
+                                total_time_spent = players.total_time_spent + $3,
+                                best_speed = CASE WHEN $4 > players.best_speed THEN $4 ELSE players.best_speed END,
+                                games_played = players.games_played + 1,
+                                best_blocks_hardcore = CASE WHEN $5 > players.best_blocks_hardcore THEN $5 ELSE players.best_blocks_hardcore END
+                        ''', user_id, game.blocks_cleared, total_time, avg_speed, game.blocks_cleared)
+                        
+                        total_blocks = await conn.fetchval('SELECT total_blocks_cleared FROM players WHERE user_id = $1', user_id)
+                        total_time_all = await conn.fetchval('SELECT total_time_spent FROM players WHERE user_id = $1', user_id)
+                        new_avg_speed = total_blocks / total_time_all if total_time_all > 0 else 0
+                        
+                        await conn.execute('''
+                            INSERT INTO speed_leaderboard (user_id, username, avg_speed, total_blocks, total_time)
+                            VALUES ($1, '', $2, $3, $4)
+                            ON CONFLICT (user_id) DO UPDATE SET
+                                avg_speed = $2, total_blocks = $3, total_time = $4, last_updated = NOW()
+                        ''', user_id, new_avg_speed, total_blocks, total_time_all)
+                    
+                    if thread_id in bot.active_games:
+                        del bot.active_games[thread_id]
+                    
+                    await thread.send(
+                        f"⏰ **ВРЕМЯ ВЫШЛО!**\n"
+                        f"Блоков пройдено: **{game.blocks_cleared}**\n"
+                        f"Время игры: **{total_time:.2f}с**\n"
+                        f"Средняя скорость: **{avg_speed:.3f} блоков/сек**"
+                    )
             except:
                 pass
             break
 
 @bot.tree.command(name="leaderboard", description="Таблица лидеров")
 async def leaderboard(interaction: discord.Interaction):
-    try:
-        await interaction.response.defer()
-    except:
-        return
+    await interaction.response.defer()
     
     async with bot.db_pool.acquire() as conn:
         records = await conn.fetch('''
             SELECT username, best_speed, total_blocks_cleared, games_played
-            FROM players WHERE best_speed > 0 ORDER BY best_speed DESC LIMIT 10
+            FROM players WHERE best_speed > 0
+            ORDER BY best_speed DESC LIMIT 10
         ''')
         
         if not records:
@@ -568,20 +520,20 @@ async def leaderboard(interaction: discord.Interaction):
         
         embed = discord.Embed(
             title="🏆 Таблица Лидеров",
-            description="**Лучшая Скорость** - лучший результат за игру",
+            description="**Лучшая Скорость** - лучший результат за одну игру",
             color=discord.Color.gold()
         )
         
         medals = ["🥇", "🥈", "🥉"]
-        text = ""
+        leaderboard_text = ""
         
-        for i, r in enumerate(records):
+        for i, record in enumerate(records):
             medal = medals[i] if i < 3 else f"`{i+1}.`"
-            text += f"{medal} **{r['username']}**\n"
-            text += f"    ⚡ **{r['best_speed']:.3f}** блоков/сек\n"
-            text += f"    📊 Игр: {r['games_played']} | Блоков: {r['total_blocks_cleared']}\n\n"
+            leaderboard_text += f"{medal} **{record['username']}**\n"
+            leaderboard_text += f"    ⚡ **{record['best_speed']:.3f}** блоков/сек\n"
+            leaderboard_text += f"    📊 Игр: {record['games_played']} | Блоков: {record['total_blocks_cleared']}\n\n"
         
-        embed.description += f"\n\n{text}"
+        embed.description += f"\n\n{leaderboard_text}"
     
     view = LeaderboardView("best")
     await interaction.followup.send(embed=embed, view=view)
@@ -596,155 +548,208 @@ class LeaderboardView(discord.ui.View):
         self.clear_items()
         
         if self.current_type == "best":
-            button = discord.ui.Button(label="⚡ Средняя скорость", style=discord.ButtonStyle.primary)
+            button = discord.ui.Button(
+                label="⚡ Показать среднюю скорость",
+                style=discord.ButtonStyle.primary,
+                emoji="📊"
+            )
             button.callback = self.show_average
         else:
-            button = discord.ui.Button(label="🏆 Лучшая скорость", style=discord.ButtonStyle.success)
+            button = discord.ui.Button(
+                label="🏆 Показать лучшую скорость",
+                style=discord.ButtonStyle.success,
+                emoji="🎯"
+            )
             button.callback = self.show_best
         
         self.add_item(button)
     
     async def show_average(self, interaction: discord.Interaction):
-        try:
-            await interaction.response.defer()
-        except:
-            return
+        await interaction.response.defer()
         
         async with bot.db_pool.acquire() as conn:
             records = await conn.fetch('''
                 SELECT username, avg_speed, total_blocks, total_time
-                FROM speed_leaderboard WHERE avg_speed > 0 ORDER BY avg_speed DESC LIMIT 10
+                FROM speed_leaderboard WHERE avg_speed > 0
+                ORDER BY avg_speed DESC LIMIT 10
             ''')
+            
+            if not records:
+                await interaction.followup.send("⚡ Таблица пуста!", ephemeral=True)
+                return
             
             embed = discord.Embed(
                 title="🏆 Таблица Лидеров",
-                description="**Средняя Скорость** - общий коэффициент",
+                description="**Средняя Скорость** - общий коэффициент (блоки ÷ время)",
                 color=discord.Color.blue()
             )
             
             medals = ["🥇", "🥈", "🥉"]
-            text = ""
+            leaderboard_text = ""
             
-            for i, r in enumerate(records):
+            for i, record in enumerate(records):
                 medal = medals[i] if i < 3 else f"`{i+1}.`"
-                text += f"{medal} **{r['username']}**\n"
-                text += f"    ⚡ **{r['avg_speed']:.3f}** блоков/сек\n"
-                text += f"    📊 {r['total_blocks']} блоков за {int(r['total_time']//60)}м\n\n"
+                hours = int(record['total_time'] // 3600)
+                minutes = int((record['total_time'] % 3600) // 60)
+                time_str = f"{hours}ч {minutes}м" if hours > 0 else f"{minutes}м"
+                
+                leaderboard_text += f"{medal} **{record['username']}**\n"
+                leaderboard_text += f"    ⚡ **{record['avg_speed']:.3f}** блоков/сек\n"
+                leaderboard_text += f"    📊 Блоков: {record['total_blocks']} за {time_str}\n\n"
             
-            embed.description += f"\n\n{text}"
+            embed.description += f"\n\n{leaderboard_text}"
         
         self.current_type = "average"
         self.update_button()
         await interaction.edit_original_response(embed=embed, view=self)
     
     async def show_best(self, interaction: discord.Interaction):
-        try:
-            await interaction.response.defer()
-        except:
-            return
+        await interaction.response.defer()
         
         async with bot.db_pool.acquire() as conn:
             records = await conn.fetch('''
                 SELECT username, best_speed, total_blocks_cleared, games_played
-                FROM players WHERE best_speed > 0 ORDER BY best_speed DESC LIMIT 10
+                FROM players WHERE best_speed > 0
+                ORDER BY best_speed DESC LIMIT 10
             ''')
             
             embed = discord.Embed(
                 title="🏆 Таблица Лидеров",
-                description="**Лучшая Скорость** - лучший результат за игру",
+                description="**Лучшая Скорость** - лучший результат за одну игру",
                 color=discord.Color.gold()
             )
             
             medals = ["🥇", "🥈", "🥉"]
-            text = ""
+            leaderboard_text = ""
             
-            for i, r in enumerate(records):
+            for i, record in enumerate(records):
                 medal = medals[i] if i < 3 else f"`{i+1}.`"
-                text += f"{medal} **{r['username']}**\n"
-                text += f"    ⚡ **{r['best_speed']:.3f}** блоков/сек\n"
-                text += f"    📊 Игр: {r['games_played']} | Блоков: {r['total_blocks_cleared']}\n\n"
+                leaderboard_text += f"{medal} **{record['username']}**\n"
+                leaderboard_text += f"    ⚡ **{record['best_speed']:.3f}** блоков/сек\n"
+                leaderboard_text += f"    📊 Игр: {record['games_played']} | Блоков: {record['total_blocks_cleared']}\n\n"
             
-            embed.description += f"\n\n{text}"
+            embed.description += f"\n\n{leaderboard_text}"
         
         self.current_type = "best"
         self.update_button()
         await interaction.edit_original_response(embed=embed, view=self)
 
 @bot.tree.command(name="profile", description="Профиль игрока")
-@app_commands.describe(user="Пользователь")
 async def profile(interaction: discord.Interaction, user: discord.User = None):
-    try:
-        await interaction.response.defer()
-    except:
-        return
-    
-    target = user or interaction.user
+    target_user = user or interaction.user
     
     async with bot.db_pool.acquire() as conn:
-        player = await conn.fetchrow('SELECT * FROM players WHERE user_id = $1', target.id)
+        player = await conn.fetchrow('SELECT * FROM players WHERE user_id = $1', target_user.id)
         
         if not player:
-            await interaction.followup.send(f"❌ Профиль не найден!")
+            msg = "❌ У вас еще нет профиля!" if target_user == interaction.user else f"❌ У {target_user.mention} еще нет профиля!"
+            await interaction.response.send_message(msg)
             return
         
-        avg_data = await conn.fetchrow('SELECT avg_speed FROM speed_leaderboard WHERE user_id = $1', target.id)
-        best_rank = await conn.fetchval('SELECT COUNT(*) + 1 FROM players WHERE best_speed > $1', player['best_speed'])
+        avg_speed_data = await conn.fetchrow('''
+            SELECT avg_speed, total_blocks, total_time 
+            FROM speed_leaderboard WHERE user_id = $1
+        ''', target_user.id)
+        
+        best_rank = await conn.fetchval('''
+            SELECT COUNT(*) + 1 FROM players WHERE best_speed > $1
+        ''', player['best_speed'])
         
         avg_rank = None
-        if avg_data:
-            avg_rank = await conn.fetchval('SELECT COUNT(*) + 1 FROM speed_leaderboard WHERE avg_speed > $1', avg_data['avg_speed'])
+        if avg_speed_data:
+            avg_rank = await conn.fetchval('''
+                SELECT COUNT(*) + 1 FROM speed_leaderboard WHERE avg_speed > $1
+            ''', avg_speed_data['avg_speed'])
     
-    embed = discord.Embed(title=f"📊 Профиль", description=f"**{target.display_name}**", color=discord.Color.blue())
-    embed.set_thumbnail(url=target.display_avatar.url)
+    embed = discord.Embed(
+        title=f"🎮 Профиль игрока",
+        color=discord.Color.from_rgb(88, 101, 242)
+    )
     
-    stats = f"""╔══════════════════════════════╗
-║     СТАТИСТИКА               ║
-╠══════════════════════════════╣
-║ Игр:   {player['games_played']:>22} ║
-║ Блоков: {player['total_blocks_cleared']:>21} ║
-║ Время:  {f"{int(player['total_time_spent']//60)}м":>21} ║
-╚══════════════════════════════╝"""
+    embed.set_author(
+        name=target_user.display_name,
+        icon_url=target_user.display_avatar.url
+    )
     
-    embed.add_field(name="📈 Общая статистика", value=f"```\n{stats}\n```", inline=False)
+    embed.set_thumbnail(url=target_user.display_avatar.url)
     
-    records = f"🏆 **Лучшая:** {player['best_speed']:.3f} блоков/с (#{best_rank})\n"
-    if avg_data:
-        records += f"⚡ **Средняя:** {avg_data['avg_speed']:.3f} блоков/с (#{avg_rank})\n"
-    records += f"🎮 **Обычный:** {player['best_blocks_normal']} блоков\n"
-    records += f"💀 **Хардкор:** {player['best_blocks_hardcore']} блоков"
+    # Общая статистика
+    hours = int(player['total_time_spent'] // 3600)
+    minutes = int((player['total_time_spent'] % 3600) // 60)
+    time_str = f"{hours}ч {minutes}м" if hours > 0 else f"{minutes}м"
     
-    embed.add_field(name="🏅 Рекорды", value=records, inline=False)
+    general_stats = (
+        f"```\n"
+        f"Игр сыграно     │ {player['games_played']}\n"
+        f"Блоков пройдено │ {player['total_blocks_cleared']}\n"
+        f"Время в игре    │ {time_str}\n"
+        f"```"
+    )
+    embed.add_field(
+        name="📊 Общая статистика",
+        value=general_stats,
+        inline=False
+    )
     
-    await interaction.followup.send(embed=embed)
-
-async def health_check(request):
-    return web.Response(text='OK', status=200)
-
-async def start_http_server():
-    app = web.Application()
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
+    # Рекорды
+    records_text = ""
     
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
-    await site.start()
-    print(f'🌐 HTTP server на порту {PORT}')
+    records_text += f"**🏆 Лучшая скорость**\n"
+    records_text += f"├ **{player['best_speed']:.3f}** блоков/сек\n"
+    records_text += f"└ Место в топе: **#{best_rank}**\n\n"
+    
+    if avg_speed_data:
+        records_text += f"**⚡ Средняя скорость**\n"
+        records_text += f"├ **{avg_speed_data['avg_speed']:.3f}** блоков/сек\n"
+        records_text += f"└ Место в топе: **#{avg_rank}**\n\n"
+    
+    if player['best_blocks_normal'] > 0:
+        records_text += f"**🎮 Обычный режим**\n"
+        records_text += f"└ Лучший забег: **{player['best_blocks_normal']}** блоков\n\n"
+    
+    if player['best_blocks_hardcore'] > 0:
+        records_text += f"**💀 Хардкор режим**\n"
+        records_text += f"└ Лучший забег: **{player['best_blocks_hardcore']}** блоков\n\n"
+    
+    embed.add_field(
+        name="🏅 Рекорды",
+        value=records_text,
+        inline=False
+    )
+    
+    # В среднем за игру
+    if player['games_played'] > 0:
+        avg_blocks_per_game = player['total_blocks_cleared'] / player['games_played']
+        avg_time_per_game = player['total_time_spent'] / player['games_played']
+        
+        additional_stats = (
+            f"```\n"
+            f"Блоков за игру  │ {avg_blocks_per_game:.1f}\n"
+            f"Времени за игру │ {avg_time_per_game:.1f}с\n"
+            f"```"
+        )
+        embed.add_field(
+            name="📈 В среднем за игру",
+            value=additional_stats,
+            inline=False
+        )
+    
+    embed.set_footer(text=f"Играет с {player['created_at'].strftime('%d.%m.%Y')} • ID: {target_user.id}")
+    embed.timestamp = datetime.now()
+    
+    await interaction.response.send_message(embed=embed)
 
 @bot.event
 async def on_ready():
-    print(f'✅ Бот: {bot.user}')
+    print(f'✅ Бот запущен как {bot.user}')
     print(f'📊 Серверов: {len(bot.guilds)}')
+    print(f'⚡ База данных подключена')
 
 @bot.event
 async def on_thread_delete(thread):
-    async with bot.db_pool.acquire() as conn:
-        await conn.execute('DELETE FROM active_games WHERE thread_id = $1', thread.id)
-
-async def main():
-    await start_http_server()
-    async with bot:
-        await bot.start(TOKEN)
+    """Очистка при удалении треда"""
+    if thread.id in bot.active_games:
+        del bot.active_games[thread.id]
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    bot.run(TOKEN)
